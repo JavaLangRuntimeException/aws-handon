@@ -1,0 +1,202 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless TODO app hands-on.
+  Frontend: S3 + CloudFront (OAC) / Backend: API Gateway (HTTP API) + Lambda + DynamoDB
+
+# すべての Lambda 関数に共通する設定
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures:
+      - arm64 # Graviton。x86_64 より安価で、多くの場合高速
+    MemorySize: 256
+    Timeout: 10
+
+Resources:
+  # ============================================================
+  # データ層: Amazon DynamoDB
+  # ============================================================
+  TodoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      # オンデマンドキャパシティ。リクエスト数に応じた従量課金で、キャパシティの見積もりが不要
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH # パーティションキー
+
+  # ============================================================
+  # API 層: Amazon API Gateway (HTTP API)
+  # ============================================================
+  TodoHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      # スロットリング（流量制限）。想定外の大量アクセスで料金が膨らむのを防ぐ
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  # ============================================================
+  # ロジック層: AWS Lambda
+  # ============================================================
+  TodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/src/
+      Handler: lambda_function.lambda_handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TodoTable
+      # SAM のポリシーテンプレート。このテーブルに対する CRUD 操作だけを許可する
+      # IAM ロール（実行ロール）が自動で作られる（最小権限の原則）
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TodoTable
+      # API Gateway のどのルートでこの関数を呼び出すか
+      Events:
+        ListTodos:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TodoHttpApi
+            Path: /api/todos
+            Method: GET
+        CreateTodo:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TodoHttpApi
+            Path: /api/todos
+            Method: POST
+        UpdateTodo:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TodoHttpApi
+            Path: /api/todos/{id}
+            Method: PUT
+        DeleteTodo:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TodoHttpApi
+            Path: /api/todos/{id}
+            Method: DELETE
+
+  # Lambda のログ出力先。明示的に作成して保持期間を設定し、スタック削除時に一緒に消えるようにする
+  TodoFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${TodoFunction}
+      RetentionInDays: 14
+
+  # ============================================================
+  # フロントエンド: Amazon S3 + Amazon CloudFront
+  # ============================================================
+  # HTML / CSS / JS を置くバケット。パブリックアクセスはすべてブロックし、
+  # CloudFront 経由でのみ読み取れるようにする
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # OAC (Origin Access Control): CloudFront が S3 にリクエストするときに署名を付ける仕組み
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # バケットポリシー: 「この CloudFront ディストリビューションからの読み取り」だけを許可する
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub ${AWS::StackName} distribution
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_200 # 日本を含むエッジロケーションを使い、最も高価な一部地域を除外
+        # オリジン = CloudFront がコンテンツを取りに行く先
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: "" # OAC を使うときは空文字を指定する（旧方式 OAI は使わない）
+          - Id: ApiOrigin
+            DomainName: !Sub ${TodoHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        # ビヘイビア = パスごとに「どのオリジンへ」「どうキャッシュするか」を決めるルール
+        # /api/* 以外（HTML / CSS / JS）は S3 へ。キャッシュを効かせる
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # マネージドポリシー: CachingOptimized
+        CacheBehaviors:
+          # /api/* は API Gateway へ。結果が毎回変わるのでキャッシュしない
+          - PathPattern: /api/*
+            TargetOriginId: ApiOrigin
+            ViewerProtocolPolicy: https-only
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - PATCH
+              - POST
+              - DELETE
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # マネージドポリシー: CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # マネージドポリシー: AllViewerExceptHostHeader
+
+Outputs:
+  WebsiteUrl:
+    Description: アプリの URL（CloudFront）
+    Value: !Sub https://${CloudFrontDistribution.DomainName}
+  ApiEndpoint:
+    Description: API Gateway のエンドポイント（動作確認用）
+    Value: !Sub https://${TodoHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  FrontendBucketName:
+    Description: フロントエンドのファイルをアップロードする S3 バケット
+    Value: !Ref FrontendBucket
+  DistributionId:
+    Description: CloudFront ディストリビューション ID（キャッシュ削除に使用）
+    Value: !Ref CloudFrontDistribution
+  TodoTableName:
+    Description: DynamoDB テーブル名
+    Value: !Ref TodoTable

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Serverless TODO</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header>
+        <h1>Serverless TODO</h1>
+        <p class="subtitle">S3 + CloudFront + API Gateway + Lambda + DynamoDB</p>
+      </header>
+
+      <form id="todo-form" class="todo-form">
+        <input
+          id="todo-input"
+          type="text"
+          placeholder="やることを入力..."
+          maxlength="100"
+          autocomplete="off"
+          required
+        />
+        <button type="submit">追加</button>
+      </form>
+
+      <p id="message" class="message" role="status" hidden></p>
+
+      <ul id="todo-list" class="todo-list"></ul>
+      <p id="empty" class="empty" hidden>TODO はまだありません 🎉</p>
+
+      <footer>
+        <span id="count"></span>
+      </footer>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
